@@ -8,6 +8,7 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from datetime import datetime
 import os
+import hmac
 from dotenv import load_dotenv
 import uuid
 
@@ -55,8 +56,8 @@ class Session(db.Model):
     
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     instance_id = db.Column(db.String(36), db.ForeignKey('instances.id'), nullable=False)
-    session_data = db.Column(db.JSON, default={})
-    conversation_history = db.Column(db.JSON, default=[])
+    session_data = db.Column(db.JSON, default=lambda: {})
+    conversation_history = db.Column(db.JSON, default=lambda: [])
     last_updated = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
@@ -96,6 +97,22 @@ class Memory(db.Model):
         }
 
 
+# ==================== AUTH ====================
+
+def require_instance(instance_id):
+    """Authenticate an instance using the X-API-Key header."""
+    instance = db.session.get(Instance, instance_id)
+    if not instance:
+        return None, (jsonify({'error': 'Instance not found'}), 404)
+
+    supplied_key = request.headers.get('X-API-Key', '')
+    if not supplied_key or not hmac.compare_digest(supplied_key, instance.api_key):
+        return None, (jsonify({'error': 'Unauthorized'}), 401)
+
+    instance.last_active = datetime.utcnow()
+    return instance, None
+
+
 # ==================== REST API ====================
 
 @app.route('/api/register', methods=['POST'])
@@ -120,9 +137,9 @@ def register_instance():
 @app.route('/api/instances/<instance_id>', methods=['GET'])
 def get_instance(instance_id):
     """Get instance info"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     return jsonify(instance.to_dict()), 200
 
 
@@ -131,9 +148,9 @@ def get_instance(instance_id):
 @app.route('/api/memory/<instance_id>', methods=['GET'])
 def get_memory(instance_id):
     """Get all memory entries for instance"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
     memories = Memory.query.filter_by(instance_id=instance_id).all()
     return jsonify([m.to_dict() for m in memories]), 200
@@ -142,9 +159,9 @@ def get_memory(instance_id):
 @app.route('/api/memory/<instance_id>/<category>', methods=['GET'])
 def get_memory_category(instance_id, category):
     """Get memory for a specific category"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
     memories = Memory.query.filter_by(instance_id=instance_id, category=category).all()
     return jsonify([m.to_dict() for m in memories]), 200
@@ -153,6 +170,10 @@ def get_memory_category(instance_id, category):
 @app.route('/api/memory/<instance_id>/<category>/<key>', methods=['GET'])
 def get_memory_key(instance_id, category, key):
     """Get specific memory entry"""
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
+
     memory = Memory.query.filter_by(
         instance_id=instance_id,
         category=category,
@@ -168,11 +189,11 @@ def get_memory_key(instance_id, category, key):
 @app.route('/api/memory/<instance_id>', methods=['POST'])
 def save_memory(instance_id):
     """Save or update memory entry"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
-    data = request.json
+    data = request.json or {}
     category = data.get('category')
     key = data.get('key')
     value = data.get('value')
@@ -200,11 +221,11 @@ def save_memory(instance_id):
     
     db.session.commit()
     
-    # Broadcast to all instances in real-time
+    # Broadcast only to clients authenticated into this sync room.
     socketio.emit('memory_updated', {
         'instance_id': instance_id,
         'memory': memory.to_dict()
-    }, broadcast=True)
+    }, to=instance_id)
     
     return jsonify(memory.to_dict()), 201
 
@@ -212,6 +233,10 @@ def save_memory(instance_id):
 @app.route('/api/memory/<instance_id>/<category>/<key>', methods=['DELETE'])
 def delete_memory(instance_id, category, key):
     """Delete memory entry"""
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
+
     memory = Memory.query.filter_by(
         instance_id=instance_id,
         category=category,
@@ -228,7 +253,7 @@ def delete_memory(instance_id, category, key):
         'instance_id': instance_id,
         'category': category,
         'key': key
-    }, broadcast=True)
+    }, to=instance_id)
     
     return jsonify({'status': 'deleted'}), 200
 
@@ -238,9 +263,9 @@ def delete_memory(instance_id, category, key):
 @app.route('/api/session/<instance_id>', methods=['GET'])
 def get_session(instance_id):
     """Get current session state"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
     session = Session.query.filter_by(instance_id=instance_id).first()
     if not session:
@@ -252,11 +277,11 @@ def get_session(instance_id):
 @app.route('/api/session/<instance_id>', methods=['POST'])
 def create_or_update_session(instance_id):
     """Create or update session state"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
-    data = request.json
+    data = request.json or {}
     session = Session.query.filter_by(instance_id=instance_id).first()
     
     if session:
@@ -279,7 +304,7 @@ def create_or_update_session(instance_id):
     socketio.emit('session_updated', {
         'instance_id': instance_id,
         'session': session.to_dict()
-    }, broadcast=True)
+    }, to=instance_id)
     
     return jsonify(session.to_dict()), 201
 
@@ -287,11 +312,11 @@ def create_or_update_session(instance_id):
 @app.route('/api/session/<instance_id>/history', methods=['POST'])
 def append_to_history(instance_id):
     """Append message to conversation history"""
-    instance = Instance.query.get(instance_id)
-    if not instance:
-        return jsonify({'error': 'Instance not found'}), 404
+    instance, error = require_instance(instance_id)
+    if error:
+        return error
     
-    data = request.json
+    data = request.json or {}
     message = data.get('message')
     
     if not message:
@@ -302,14 +327,15 @@ def append_to_history(instance_id):
         session = Session(instance_id=instance_id)
         db.session.add(session)
     
-    session.conversation_history.append(message)
+    # Reassign the JSON list so SQLAlchemy reliably detects the change.
+    session.conversation_history = [*(session.conversation_history or []), message]
     session.last_updated = datetime.utcnow()
     db.session.commit()
     
     socketio.emit('history_updated', {
         'instance_id': instance_id,
         'message': message
-    }, broadcast=True)
+    }, to=instance_id)
     
     return jsonify({'status': 'appended', 'total_messages': len(session.conversation_history)}), 201
 
@@ -325,8 +351,16 @@ def handle_connect():
 
 @socketio.on('join_instance')
 def on_join_instance(data):
-    """Join instance-specific room for targeted broadcasts"""
+    """Authenticate and join the instance-specific sync room."""
+    data = data or {}
     instance_id = data.get('instance_id')
+    api_key = data.get('api_key', '')
+    instance = db.session.get(Instance, instance_id) if instance_id else None
+
+    if not instance or not api_key or not hmac.compare_digest(api_key, instance.api_key):
+        emit('join_error', {'error': 'Unauthorized'})
+        return
+
     join_room(instance_id)
     emit('joined', {'instance_id': instance_id, 'status': 'joined'})
 
