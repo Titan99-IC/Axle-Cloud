@@ -549,7 +549,7 @@ def handle_disconnect():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'ok'}), 200
+    return jsonify({'status': 'ok', 'sync_identity_version': 3}), 200
 
 
 # ==================== DB INITIALIZATION ====================
