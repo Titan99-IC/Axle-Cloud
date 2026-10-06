@@ -9,6 +9,7 @@ from flask_cors import CORS
 from datetime import datetime
 import os
 import hmac
+import secrets
 from dotenv import load_dotenv
 import uuid
 
@@ -29,7 +30,12 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # ==================== MODELS ====================
 
 class Instance(db.Model):
-    """Represents an Axle device instance"""
+    """Legacy-named sync account.
+
+    Existing Instance rows are preserved as the shared account identity so the
+    current memory/session data does not need a destructive database migration.
+    Individual computers are represented by Device rows below.
+    """
     __tablename__ = 'instances'
     
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -44,6 +50,32 @@ class Instance(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'device_name': self.device_name,
+            'last_active': self.last_active.isoformat(),
+            'created_at': self.created_at.isoformat()
+        }
+
+
+class Device(db.Model):
+    """One trusted Axle installation attached to a shared sync account."""
+    __tablename__ = 'devices'
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    account_id = db.Column(db.String(36), db.ForeignKey('instances.id'), nullable=False, index=True)
+    api_key = db.Column(db.String(255), unique=True, nullable=False)
+    device_name = db.Column(db.String(255), nullable=False)
+    last_active = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    account = db.relationship(
+        'Instance',
+        backref=db.backref('devices', lazy=True, cascade='all, delete-orphan')
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'account_id': self.account_id,
             'device_name': self.device_name,
             'last_active': self.last_active.isoformat(),
             'created_at': self.created_at.isoformat()
@@ -99,18 +131,68 @@ class Memory(db.Model):
 
 # ==================== AUTH ====================
 
-def require_instance(instance_id):
-    """Authenticate an instance using the X-API-Key header."""
-    instance = db.session.get(Instance, instance_id)
-    if not instance:
-        return None, (jsonify({'error': 'Instance not found'}), 404)
-
+def _account_key_matches(account):
     supplied_key = request.headers.get('X-API-Key', '')
-    if not supplied_key or not hmac.compare_digest(supplied_key, instance.api_key):
-        return None, (jsonify({'error': 'Unauthorized'}), 401)
+    return bool(supplied_key and hmac.compare_digest(supplied_key, account.api_key))
 
-    instance.last_active = datetime.utcnow()
-    return instance, None
+
+def _device_for_request(account_id):
+    device_id = request.headers.get('X-Device-ID', '')
+    device_key = request.headers.get('X-Device-Key', '')
+    if not device_id and not device_key:
+        return None, None
+    if not device_id or not device_key:
+        return None, (jsonify({'error': 'Both X-Device-ID and X-Device-Key are required'}), 401)
+
+    device = db.session.get(Device, device_id)
+    if (
+        not device
+        or device.account_id != account_id
+        or not hmac.compare_digest(device_key, device.api_key)
+    ):
+        return None, (jsonify({'error': 'Unauthorized device'}), 401)
+    return device, None
+
+
+def require_account_key(account_id):
+    """Require the shared account key for device-management operations."""
+    account = db.session.get(Instance, account_id)
+    if not account:
+        return None, (jsonify({'error': 'Account not found'}), 404)
+    if not _account_key_matches(account):
+        return None, (jsonify({'error': 'Unauthorized'}), 401)
+    account.last_active = datetime.utcnow()
+    db.session.commit()
+    return account, None
+
+
+def require_instance(instance_id):
+    """Authenticate access to a shared account.
+
+    Preferred auth is a per-device ID/key pair. The original shared X-API-Key
+    remains accepted for backwards compatibility while existing installations
+    migrate to device credentials.
+    """
+    account = db.session.get(Instance, instance_id)
+    if not account:
+        return None, (jsonify({'error': 'Account not found'}), 404)
+
+    device, device_error = _device_for_request(instance_id)
+    if device_error:
+        return None, device_error
+
+    if device is not None:
+        device.last_active = datetime.utcnow()
+        account.last_active = datetime.utcnow()
+        db.session.commit()
+        return account, None
+
+    if _account_key_matches(account):
+        account.last_active = datetime.utcnow()
+        db.session.commit()
+        return account, None
+
+    return None, (jsonify({'error': 'Unauthorized'}), 401)
 
 
 def safe_socket_emit(event, payload, room):
@@ -149,11 +231,63 @@ def register_instance():
 
 @app.route('/api/instances/<instance_id>', methods=['GET'])
 def get_instance(instance_id):
-    """Get instance info"""
+    """Get shared account info (legacy route name kept for compatibility)."""
     instance, error = require_instance(instance_id)
     if error:
         return error
     return jsonify(instance.to_dict()), 200
+
+
+# ==================== DEVICE MANAGEMENT ====================
+
+@app.route('/api/accounts/<account_id>/devices', methods=['POST'])
+def register_device(account_id):
+    """Create a unique credential for one trusted Axle installation."""
+    account, error = require_account_key(account_id)
+    if error:
+        return error
+
+    data = request.json or {}
+    device_name = str(data.get('device_name') or 'Axle Device').strip()[:255] or 'Axle Device'
+    device_key = secrets.token_urlsafe(32)
+    device = Device(
+        account_id=account.id,
+        api_key=device_key,
+        device_name=device_name,
+    )
+    db.session.add(device)
+    db.session.commit()
+
+    return jsonify({
+        'account_id': account.id,
+        'device_id': device.id,
+        'device_key': device_key,
+        'device_name': device.device_name,
+    }), 201
+
+
+@app.route('/api/accounts/<account_id>/devices', methods=['GET'])
+def list_devices(account_id):
+    """List trusted devices. Requires the shared account key."""
+    account, error = require_account_key(account_id)
+    if error:
+        return error
+    devices = Device.query.filter_by(account_id=account.id).order_by(Device.created_at.asc()).all()
+    return jsonify([device.to_dict() for device in devices]), 200
+
+
+@app.route('/api/accounts/<account_id>/devices/<device_id>', methods=['DELETE'])
+def revoke_device(account_id, device_id):
+    """Revoke one device credential without affecting shared memory."""
+    account, error = require_account_key(account_id)
+    if error:
+        return error
+    device = Device.query.filter_by(id=device_id, account_id=account.id).first()
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+    db.session.delete(device)
+    db.session.commit()
+    return jsonify({'status': 'revoked', 'device_id': device_id}), 200
 
 
 # ==================== MEMORY ENDPOINTS ====================
@@ -364,18 +498,45 @@ def handle_connect():
 
 @socketio.on('join_instance')
 def on_join_instance(data):
-    """Authenticate and join the instance-specific sync room."""
+    """Authenticate a device and join the shared account sync room."""
     data = data or {}
-    instance_id = data.get('instance_id')
-    api_key = data.get('api_key', '')
-    instance = db.session.get(Instance, instance_id) if instance_id else None
+    account_id = data.get('account_id') or data.get('instance_id')
+    account = db.session.get(Instance, account_id) if account_id else None
+    if not account:
+        emit('join_error', {'error': 'Account not found'})
+        return
 
-    if not instance or not api_key or not hmac.compare_digest(api_key, instance.api_key):
+    device_id = data.get('device_id', '')
+    device_key = data.get('device_key', '')
+    if device_id or device_key:
+        device = db.session.get(Device, device_id) if device_id else None
+        if (
+            not device
+            or device.account_id != account_id
+            or not device_key
+            or not hmac.compare_digest(device_key, device.api_key)
+        ):
+            emit('join_error', {'error': 'Unauthorized device'})
+            return
+        device.last_active = datetime.utcnow()
+        account.last_active = datetime.utcnow()
+        db.session.commit()
+        join_room(account_id)
+        emit('joined', {
+            'account_id': account_id,
+            'device_id': device.id,
+            'status': 'joined'
+        })
+        return
+
+    # Legacy shared-key login remains available during migration.
+    api_key = data.get('api_key', '')
+    if not api_key or not hmac.compare_digest(api_key, account.api_key):
         emit('join_error', {'error': 'Unauthorized'})
         return
 
-    join_room(instance_id)
-    emit('joined', {'instance_id': instance_id, 'status': 'joined'})
+    join_room(account_id)
+    emit('joined', {'account_id': account_id, 'status': 'joined', 'legacy_auth': True})
 
 
 @socketio.on('disconnect')
