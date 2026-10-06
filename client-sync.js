@@ -13,6 +13,11 @@ class AxleSyncClient {
     this.callbacks = {};
   }
 
+  authHeaders(extra = {}) {
+    if (!this.apiKey) throw new Error('No API key. Register or restore the sync identity first.');
+    return { ...extra, 'X-API-Key': this.apiKey };
+  }
+
   /**
    * Register this device and get instance ID + API key
    */
@@ -72,7 +77,11 @@ class AxleSyncClient {
 
     this.socket.on('connect', () => {
       console.log('✓ WebSocket connected');
-      this.socket.emit('join_instance', { instance_id: this.instanceId });
+      this.socket.emit('join_instance', { instance_id: this.instanceId, api_key: this.apiKey });
+    });
+
+    this.socket.on('join_error', (data) => {
+      console.error('Sync authorization failed:', data);
     });
 
     this.socket.on('memory_updated', (data) => {
@@ -111,7 +120,7 @@ class AxleSyncClient {
     try {
       const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ category, key, value })
       });
       
@@ -131,7 +140,7 @@ class AxleSyncClient {
    */
   async getMemory() {
     try {
-      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}`);
+      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}`, { headers: this.authHeaders() });
       if (!response.ok) throw new Error('Fetch failed');
       return await response.json();
     } catch (error) {
@@ -145,7 +154,7 @@ class AxleSyncClient {
    */
   async getMemoryCategory(category) {
     try {
-      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}/${category}`);
+      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}/${category}`, { headers: this.authHeaders() });
       if (!response.ok) throw new Error('Fetch failed');
       return await response.json();
     } catch (error) {
@@ -159,7 +168,7 @@ class AxleSyncClient {
    */
   async getMemoryKey(category, key) {
     try {
-      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}/${category}/${key}`);
+      const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}/${category}/${key}`, { headers: this.authHeaders() });
       if (!response.ok) throw new Error('Fetch failed');
       return await response.json();
     } catch (error) {
@@ -174,7 +183,8 @@ class AxleSyncClient {
   async deleteMemory(category, key) {
     try {
       const response = await fetch(`${this.backendUrl}/api/memory/${this.instanceId}/${category}/${key}`, {
-        method: 'DELETE'
+        method: 'DELETE',
+        headers: this.authHeaders()
       });
       if (!response.ok) throw new Error('Delete failed');
       console.log('🗑️ Deleted:', { category, key });
@@ -192,7 +202,7 @@ class AxleSyncClient {
     try {
       const response = await fetch(`${this.backendUrl}/api/session/${this.instanceId}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ session_data: sessionData, conversation_history: conversationHistory })
       });
       
@@ -212,7 +222,7 @@ class AxleSyncClient {
    */
   async getSession() {
     try {
-      const response = await fetch(`${this.backendUrl}/api/session/${this.instanceId}`);
+      const response = await fetch(`${this.backendUrl}/api/session/${this.instanceId}`, { headers: this.authHeaders() });
       if (!response.ok) throw new Error('No session');
       return await response.json();
     } catch (error) {
@@ -228,7 +238,7 @@ class AxleSyncClient {
     try {
       const response = await fetch(`${this.backendUrl}/api/session/${this.instanceId}/history`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ message })
       });
       
