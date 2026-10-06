@@ -113,6 +113,19 @@ def require_instance(instance_id):
     return instance, None
 
 
+def safe_socket_emit(event, payload, room):
+    """Best-effort realtime notification.
+
+    A WebSocket delivery problem must never turn an already-successful
+    database write into an HTTP 500 response. Log the failure and let the
+    REST request succeed; clients can still reconcile from PostgreSQL.
+    """
+    try:
+        socketio.emit(event, payload, to=room)
+    except Exception:
+        app.logger.exception("Socket.IO emit failed for event %s", event)
+
+
 # ==================== REST API ====================
 
 @app.route('/api/register', methods=['POST'])
@@ -221,11 +234,11 @@ def save_memory(instance_id):
     
     db.session.commit()
     
-    # Broadcast only to clients authenticated into this sync room.
-    socketio.emit('memory_updated', {
+    # Realtime notification is best-effort; PostgreSQL is the source of truth.
+    safe_socket_emit('memory_updated', {
         'instance_id': instance_id,
         'memory': memory.to_dict()
-    }, to=instance_id)
+    }, instance_id)
     
     return jsonify(memory.to_dict()), 201
 
@@ -249,11 +262,11 @@ def delete_memory(instance_id, category, key):
     db.session.delete(memory)
     db.session.commit()
     
-    socketio.emit('memory_deleted', {
+    safe_socket_emit('memory_deleted', {
         'instance_id': instance_id,
         'category': category,
         'key': key
-    }, to=instance_id)
+    }, instance_id)
     
     return jsonify({'status': 'deleted'}), 200
 
@@ -301,10 +314,10 @@ def create_or_update_session(instance_id):
     db.session.commit()
     
     # Broadcast update
-    socketio.emit('session_updated', {
+    safe_socket_emit('session_updated', {
         'instance_id': instance_id,
         'session': session.to_dict()
-    }, to=instance_id)
+    }, instance_id)
     
     return jsonify(session.to_dict()), 201
 
@@ -332,10 +345,10 @@ def append_to_history(instance_id):
     session.last_updated = datetime.utcnow()
     db.session.commit()
     
-    socketio.emit('history_updated', {
+    safe_socket_emit('history_updated', {
         'instance_id': instance_id,
         'message': message
-    }, to=instance_id)
+    }, instance_id)
     
     return jsonify({'status': 'appended', 'total_messages': len(session.conversation_history)}), 201
 
